@@ -1992,6 +1992,24 @@ impl KvmVcpu {
             .is_some_and(|h| h.reclaims_shared_mapping())
     }
 
+    /// The parts of `[gpa, gpa + size)` backed by guest RAM, as `(gpa, size)`.
+    #[cfg(feature = "sev_snp")]
+    fn guest_ram_chunks(
+        memory_slots: &Option<Arc<RwLock<HashMap<u32, KvmMemorySlot>>>>,
+        gpa: u64,
+        size: u64,
+    ) -> Vec<(u64, u64)> {
+        let Some(slots) = memory_slots else {
+            return Vec::new();
+        };
+        let slots = slots.read().unwrap();
+        gpa_ram_chunks(
+            slots.values().map(|s| (s.guest_phys_addr, s.memory_size)),
+            gpa,
+            size,
+        )
+    }
+
     fn punch_holes_in_guest_memfd(
         memory_slots: &Option<Arc<RwLock<HashMap<u32, KvmMemorySlot>>>>,
         gpa: u64,
@@ -2727,7 +2745,30 @@ impl cpu::Vcpu for KvmVcpu {
                             // bits[5-63] = zero
                             let attributes = hypercall.args[2];
                             // TODO: Add 2mb page support
-                            let size = num_pages * PAGE_SIZE_4K;
+                            // The guest chooses address and num_pages, and KVM
+                            // only checks alignment and wrap-around. A range far
+                            // beyond guest RAM would make KVM_SET_MEMORY_ATTRIBUTES
+                            // reserve per-page state for all of it in the host
+                            // kernel, so only the parts backed by guest RAM are
+                            // converted (memory slots are not contiguous). A
+                            // range with no RAM at all is refused with EINVAL.
+                            // KVM accepts only 0, EINVAL or EAGAIN (positive) as
+                            // the result of this exit (kvm_is_valid_map_gpa_range_ret()):
+                            // anything else fails the next KVM_RUN for SNP page
+                            // state changes.
+                            let chunks = num_pages
+                                .checked_mul(PAGE_SIZE_4K)
+                                .map(|size| {
+                                    Self::guest_ram_chunks(&self.memory_slots, address, size)
+                                })
+                                .unwrap_or_default();
+                            if chunks.is_empty() {
+                                warn!(
+                                    "KVM_HC_MAP_GPA_RANGE outside guest memory: address={address:#x}, pages={num_pages}"
+                                );
+                                *hypercall.ret = libc::EINVAL as u64;
+                                return Ok(cpu::VmExit::Ignore);
+                            }
                             // bit 4 = private attribute encoding
                             const PRIVATE_ENCODING_BITMASK: u64 = 0b10000;
                             debug!(
@@ -2740,28 +2781,39 @@ impl cpu::Vcpu for KvmVcpu {
                                 // https://docs.kernel.org/virt/kvm/api.html#kvm-set-memory-attributes
                                 0u64
                             };
-                            let mem_attributes = kvm_memory_attributes {
-                                address,
-                                size,
-                                attributes: set_private_attr,
-                                ..Default::default()
-                            };
-                            self.vm_fd
-                                .set_memory_attributes(mem_attributes)
-                                .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()))?;
+                            // Report success explicitly: older kernels do not reset
+                            // the result for SNP page state changes, so an earlier
+                            // refusal could otherwise be returned again. (A failure
+                            // below is a fatal vCPU error, never seen by the guest.)
+                            *hypercall.ret = 0;
+                            for (address, size) in chunks {
+                                let mem_attributes = kvm_memory_attributes {
+                                    address,
+                                    size,
+                                    attributes: set_private_attr,
+                                    ..Default::default()
+                                };
+                                self.vm_fd
+                                    .set_memory_attributes(mem_attributes)
+                                    .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()))?;
 
-                            if set_private_attr == 0 {
-                                Self::punch_holes_in_guest_memfd(&self.memory_slots, address, size);
-                            }
+                                if set_private_attr == 0 {
+                                    Self::punch_holes_in_guest_memfd(
+                                        &self.memory_slots,
+                                        address,
+                                        size,
+                                    );
+                                }
 
-                            self.notify_memory_conversion_handler(
-                                address,
-                                size,
-                                set_private_attr == 0,
-                            )?;
+                                self.notify_memory_conversion_handler(
+                                    address,
+                                    size,
+                                    set_private_attr == 0,
+                                )?;
 
-                            if set_private_attr != 0 && self.should_discard_shared_mapping() {
-                                Self::discard_shared_mapping(&self.memory_slots, address, size);
+                                if set_private_attr != 0 && self.should_discard_shared_mapping() {
+                                    Self::discard_shared_mapping(&self.memory_slots, address, size);
+                                }
                             }
 
                             Ok(cpu::VmExit::Ignore)
@@ -4195,5 +4247,82 @@ mod tests {
 
         vcpu0.set_regs(&core_regs).unwrap();
         assert_eq!(vcpu0.get_regs().unwrap(), core_regs);
+    }
+}
+
+/// The parts of `[gpa, gpa + size)` inside the `(start, size)` RAM ranges, as
+/// `(gpa, size)` in address order. Adjacent ranges are merged with
+/// `chunk_by`, so a request spanning neighbouring slots stays one chunk; gaps
+/// between slots are skipped. Empty or wrapping requests yield nothing.
+/// The ranges must not overlap, which holds for KVM memory slots.
+#[cfg(feature = "sev_snp")]
+fn gpa_ram_chunks(
+    ranges: impl Iterator<Item = (u64, u64)>,
+    gpa: u64,
+    size: u64,
+) -> Vec<(u64, u64)> {
+    let Some(end) = gpa.checked_add(size).filter(|_| size != 0) else {
+        return Vec::new();
+    };
+    let mut ranges: Vec<(u64, u64)> = ranges
+        .filter_map(|(start, len)| Some((start, start.checked_add(len)?)))
+        .filter(|(start, range_end)| start < range_end)
+        .collect();
+    ranges.sort_unstable();
+    ranges
+        .chunk_by(|a, b| b.0 <= a.1)
+        .map(|run| (run[0].0, run.iter().map(|r| r.1).max().unwrap()))
+        .filter_map(|(start, run_end)| {
+            let lo = gpa.max(start);
+            let hi = end.min(run_end);
+            (lo < hi).then(|| (lo, hi - lo))
+        })
+        .collect()
+}
+
+#[cfg(all(test, feature = "sev_snp"))]
+mod gpa_range_tests {
+    use std::iter;
+
+    use super::gpa_ram_chunks;
+
+    // Typical layout: low RAM below the PCI hole, high RAM above 4 GiB.
+    const RAM: [(u64, u64); 2] = [(0, 0x8000_0000), (0x1_0000_0000, 0x4000_0000)];
+
+    #[test]
+    fn inside_one_slot() {
+        assert_eq!(
+            gpa_ram_chunks(RAM.into_iter(), 0x1000, 0x1000),
+            [(0x1000, 0x1000)]
+        );
+    }
+
+    #[test]
+    fn adjacent_slots_stay_one_chunk() {
+        let adjacent = [(0x1000, 0x1000), (0, 0x1000)];
+        assert_eq!(
+            gpa_ram_chunks(adjacent.into_iter(), 0x800, 0x1000),
+            [(0x800, 0x1000)]
+        );
+    }
+
+    #[test]
+    fn a_range_across_the_hole_is_split_and_the_gap_skipped() {
+        assert_eq!(
+            gpa_ram_chunks(RAM.into_iter(), 0x7fff_f000, 0x8000_2000),
+            [(0x7fff_f000, 0x1000), (0x1_0000_0000, 0x1000)]
+        );
+    }
+
+    #[test]
+    fn beyond_ram_is_clipped_and_no_ram_yields_nothing() {
+        assert_eq!(
+            gpa_ram_chunks(RAM.into_iter(), 0x1_3fff_f000, 1 << 48),
+            [(0x1_3fff_f000, 0x1000)]
+        );
+        assert!(gpa_ram_chunks(RAM.into_iter(), 0x9000_0000, 0x1000).is_empty());
+        assert!(gpa_ram_chunks(RAM.into_iter(), 0x1000, 0).is_empty());
+        assert!(gpa_ram_chunks(RAM.into_iter(), u64::MAX - 0xfff, 0x2000).is_empty());
+        assert!(gpa_ram_chunks(iter::empty(), 0, 0x1000).is_empty());
     }
 }
